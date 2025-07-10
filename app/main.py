@@ -36,7 +36,9 @@ def query_solr(q, uri, page, rows):
     bbox_field = f"ocr_hitbox_{LANG_CODE}_tsm"
 
     solr_params = {
-        "q": f"ocr_word_{LANG_CODE}_ssim:{query_word}",
+        "q": query_word,
+        "defType": "edismax",
+        "qf": f"ocr_text_{LANG_CODE}_tsimv",
         "rows": rows,
         "start": (page - 1) * rows,
         "wt": "json",
@@ -50,7 +52,9 @@ def query_solr(q, uri, page, rows):
     try:
         solr_resp = requests.get(solr_url, params=solr_params, timeout=10)
         solr_resp.raise_for_status()
+        logger.debug(f"Solr URL: {solr_resp.url}")
         data = solr_resp.json()
+        #logger.debug(json.dumps(data, indent=2))
         return data.get("response", {}).get("docs", []), data.get("response", {}).get("numFound", 0)
     except requests.RequestException as e:
         logger.error(f"Solr error: {e}")
@@ -76,6 +80,7 @@ def search_1():
     hits = []
     bbox_field = f"ocr_hitbox_{LANG_CODE}_tsm"
 
+    query_terms = [term.lower() for term in q.split()]
     for doc in docs:
         canvas_id = doc.get("canvas_id_ssi")
         if not canvas_id:
@@ -86,7 +91,7 @@ def search_1():
         for idx, val in enumerate(hitboxes):
             try:
                 word, bbox = val.split("|", 1)
-                if word.lower() != q.lower():
+                if word.lower() not in query_terms:
                     continue
                 xywh = convert_bbox_to_xywh(bbox)
                 if xywh is None:
