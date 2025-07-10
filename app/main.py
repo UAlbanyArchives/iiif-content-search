@@ -1,9 +1,10 @@
 import os
+import re
 import json
 import requests
 import logging
 from flask import Flask, request, jsonify
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+from urllib.parse import urlencode
 
 app = Flask(__name__)
 
@@ -15,47 +16,54 @@ SOLR_BASE_URL = os.environ.get("SOLR_URL", "http://localhost:8983/solr")
 SOLR_CORE = os.environ.get("SOLR_CORE", "texts")
 LANG_CODE = os.environ.get("OCR_LANG_CODE", "en")
 
-@app.route("/search", methods=["GET"])
-def search():
+def escape_solr_term(term):
+    # Basic escape for special chars in Solr query syntax
+    return re.sub(r'([+\-&|!(){}\[\]^"~*?:\\/])', r'\\\1', term)
+    
+def query_solr(q, uri, page, rows):
+    query_word = escape_solr_term(q.lower())
+    bbox_field = f"ocr_hitbox_{LANG_CODE}_tsm"
+
+    solr_params = {
+        "q": f"ocr_word_{LANG_CODE}_ssim:{query_word}",
+        "rows": rows,
+        "start": (page - 1) * rows,
+        "wt": "json",
+        "fl": f"id,canvas_id_ssi,{bbox_field}"
+    }
+
+    if uri:
+        solr_params["fq"] = f'canvas_id_ssi:"{uri}"'
+
+    solr_url = f"{SOLR_BASE_URL}/{SOLR_CORE}/select"
+    try:
+        solr_resp = requests.get(solr_url, params=solr_params, timeout=10)
+        solr_resp.raise_for_status()
+        data = solr_resp.json()
+        return data.get("response", {}).get("docs", []), data.get("response", {}).get("numFound", 0)
+    except requests.RequestException as e:
+        logger.error(f"Solr error: {e}")
+        return None, None
+
+
+@app.route("/search/1", methods=["GET"])
+def search_1():
     q = request.args.get("q")
     uri = request.args.get("uri")
     page = int(request.args.get("page", 1))
     rows = int(request.args.get("rows", 50))
+    start_index = (page - 1) * rows
 
     if not q:
         return jsonify({"error": "Missing required query parameter 'q'"}), 400
 
-    # Use language-specific field with termVectors enabled
-    text_field = f"ocr_text_{LANG_CODE}_tsimv"
-    bbox_field = f"ocr_hitbox_{LANG_CODE}_tsm"
-
-    fq = [f"{text_field}:{q}"]
-    if uri:
-        fq.append(f"canvas_id_ssi:\"{uri}\"")
-
-    solr_params = {
-        "q": f"{text_field}:{q}",
-        "fq": fq,
-        "rows": rows,
-        "start": (page - 1) * rows,
-        "wt": "json",
-        "fl": f"id,canvas_id_ssi,{text_field},{bbox_field}"
-    }
-
-    solr_url = f"{SOLR_BASE_URL}/{SOLR_CORE}/select"
-
-    try:
-        solr_resp = requests.get(solr_url, params=solr_params, timeout=10)
-        solr_resp.raise_for_status()
-    except requests.RequestException as e:
-        logger.error(f"Solr error: {e}")
+    docs, total = query_solr(q, uri, page, rows)
+    if docs is None:
         return jsonify({"error": "Solr unavailable"}), 503
 
-    docs = solr_resp.json().get("response", {}).get("docs", [])
-    total = solr_resp.json().get("response", {}).get("numFound", 0)
-
-    hits = []
     annotations = []
+    hits = []
+    bbox_field = f"ocr_hitbox_{LANG_CODE}_tsm"
 
     for doc in docs:
         canvas_id = doc.get("canvas_id_ssi")
@@ -64,12 +72,78 @@ def search():
 
         hitboxes = doc.get(bbox_field, [])
 
+        for idx, val in enumerate(hitboxes):
+            try:
+                word, bbox = val.split("|", 1)
+                if word.lower() != q.lower():
+                    continue
+            except Exception:
+                continue
+
+            anno_id = f"urn:ocracoke:{doc['id']}:annotation{idx}"
+            xywh = bbox.replace(" ", ",")
+            annotations.append({
+                "@id": anno_id,
+                "@type": "oa:Annotation",
+                "motivation": "sc:painting",
+                "resource": {
+                    "@type": "cnt:ContentAsText",
+                    "chars": word
+                },
+                "on": f"{canvas_id}#xywh={xywh}"
+            })
+
+            hits.append({
+                "@type": "search:Hit",
+                "annotations": [anno_id]
+            })
+
+    return jsonify({
+        "@context": "http://iiif.io/api/search/0/context.json",
+        "@id": request.url,
+        "@type": "sc:AnnotationList",
+        "startIndex": start_index,
+        "within": {
+            "ignored": [],
+            "total": total,
+            "@type": "sc:Layer"
+        },
+        "hits": hits,
+        "resources": annotations
+    })
+
+
+
+@app.route("/search/2", methods=["GET"])
+def search_2():
+    q = request.args.get("q")
+    uri = request.args.get("uri")
+    page = int(request.args.get("page", 1))
+    rows = int(request.args.get("rows", 50))
+
+    if not q:
+        return jsonify({"error": "Missing required query parameter 'q'"}), 400
+
+    docs, total = query_solr(q, uri, page, rows)
+    if docs is None:
+        return jsonify({"error": "Solr unavailable"}), 503
+
+    hits = []
+    annotations = []
+    bbox_field = f"ocr_hitbox_{LANG_CODE}_tsm"
+
+    for doc in docs:
+        canvas_id = doc.get("canvas_id_ssi")
+        if not canvas_id:
+            continue
+
+        hitboxes = doc.get(bbox_field, [])
         annos = []
         for idx, val in enumerate(hitboxes):
             try:
                 word, bbox = val.split("|", 1)
                 xywh = bbox.replace(" ", ",")
-            except ValueError:
+            except Exception:
                 continue
 
             anno_id = f"{request.url_root.rstrip('/')}/annotation/{doc['id']}_{idx}"
@@ -95,7 +169,11 @@ def search():
         })
 
     base_url = request.base_url
-    query_args = request.args.to_dict()
+
+    def with_page(p):
+        q_args = request.args.copy()
+        q_args["page"] = str(p)
+        return f"{base_url}?{urlencode(q_args)}"
 
     response = {
         "@context": "http://iiif.io/api/search/2/context.json",
@@ -109,12 +187,6 @@ def search():
         "hits": hits
     }
 
-    # Pagination
-    def with_page(p):
-        q = request.args.copy()
-        q["page"] = str(p)
-        return f"{base_url}?{urlencode(q)}"
-
     if total > page * rows:
         response["within"]["next"] = with_page(page + 1)
     if page > 1:
@@ -125,7 +197,6 @@ def search():
 
 @app.route("/annotation/<annotation_id>", methods=["GET"])
 def get_annotation(annotation_id):
-    # Not persisted, so return minimal example
     return jsonify({
         "id": f"{request.url_root.rstrip('/')}/annotation/{annotation_id}",
         "type": "Annotation",
@@ -138,7 +209,7 @@ def get_annotation(annotation_id):
     })
 
 
-@app.route("/health", methods=["GET"])
+@app.route("/search/health", methods=["GET"])
 def health_check():
     try:
         solr_url = f"{SOLR_BASE_URL}/{SOLR_CORE}/select"
