@@ -19,7 +19,18 @@ LANG_CODE = os.environ.get("OCR_LANG_CODE", "en")
 def escape_solr_term(term):
     # Basic escape for special chars in Solr query syntax
     return re.sub(r'([+\-&|!(){}\[\]^"~*?:\\/])', r'\\\1', term)
-    
+
+def convert_bbox_to_xywh(bbox_str):
+    # bbox_str example: "2946 2016 3091 2055"
+    try:
+        x1, y1, x2, y2 = map(int, bbox_str.strip().split())
+        width = x2 - x1
+        height = y2 - y1
+        return f"{x1},{y1},{width},{height}"
+    except Exception as e:
+        logger.error(f"Invalid bbox format: {bbox_str} - {e}")
+        return None
+
 def query_solr(q, uri, page, rows):
     query_word = escape_solr_term(q.lower())
     bbox_field = f"ocr_hitbox_{LANG_CODE}_tsm"
@@ -77,11 +88,13 @@ def search_1():
                 word, bbox = val.split("|", 1)
                 if word.lower() != q.lower():
                     continue
+                xywh = convert_bbox_to_xywh(bbox)
+                if xywh is None:
+                    continue
             except Exception:
                 continue
 
-            anno_id = f"urn:ocracoke:{doc['id']}:annotation{idx}"
-            xywh = bbox.replace(" ", ",")
+            anno_id = f"{request.url_root.rstrip('/')}/annotation/{doc['id']}_{idx}"
             annotations.append({
                 "@id": anno_id,
                 "@type": "oa:Annotation",
@@ -142,7 +155,9 @@ def search_2():
         for idx, val in enumerate(hitboxes):
             try:
                 word, bbox = val.split("|", 1)
-                xywh = bbox.replace(" ", ",")
+                xywh = convert_bbox_to_xywh(bbox)
+                if xywh is None:
+                    continue
             except Exception:
                 continue
 
