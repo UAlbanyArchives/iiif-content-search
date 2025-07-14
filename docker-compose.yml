@@ -3,6 +3,7 @@ version: "3.8"
 services:
   iiif-content-search:
     build: .
+    restart: unless-stopped
     ports:
       - "8001:5000"
     environment:
