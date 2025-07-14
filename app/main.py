@@ -31,7 +31,7 @@ def convert_bbox_to_xywh(bbox_str):
         logger.error(f"Invalid bbox format: {bbox_str} - {e}")
         return None
 
-def query_solr(q, uri, page, rows):
+def query_solr(q, uri, page, rows, object_id=None):
     query_word = escape_solr_term(q.lower())
     bbox_field = f"ocr_hitbox_{LANG_CODE}_tsm"
 
@@ -45,8 +45,14 @@ def query_solr(q, uri, page, rows):
         "fl": f"id,canvas_id_ssi,{bbox_field}"
     }
 
+    fq_clauses = []
     if uri:
-        solr_params["fq"] = f'canvas_id_ssi:"{uri}"'
+        fq_clauses.append(f'canvas_id_ssi:"{uri}"')
+    if object_id:
+        fq_clauses.append(f'object_id_ssi:"{object_id}"')
+
+    if fq_clauses:
+        solr_params["fq"] = fq_clauses
 
     solr_url = f"{SOLR_BASE_URL}/{SOLR_CORE}/select"
     try:
@@ -61,8 +67,8 @@ def query_solr(q, uri, page, rows):
         return None, None
 
 
-@app.route("/search/1", methods=["GET"])
-def search_1():
+@app.route("/search/1/<collection_id>/<object_id>", methods=["GET"])
+def search_1(collection_id, object_id):
     q = request.args.get("q")
     uri = request.args.get("uri")
     page = int(request.args.get("page", 1))
@@ -72,7 +78,7 @@ def search_1():
     if not q:
         return jsonify({"error": "Missing required query parameter 'q'"}), 400
 
-    docs, total = query_solr(q, uri, page, rows)
+    docs, total = query_solr(q, uri, page, rows, object_id=f"{collection_id}/{object_id}")
     if docs is None:
         return jsonify({"error": "Solr unavailable"}), 503
 
@@ -131,8 +137,8 @@ def search_1():
     })
 
 
-
-@app.route("/search/2", methods=["GET"])
+# not fully implemented
+@app.route("/search/2/<collection_id>/<object_id>", methods=["GET"])
 def search_2():
     q = request.args.get("q")
     uri = request.args.get("uri")

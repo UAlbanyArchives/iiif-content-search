@@ -1,5 +1,5 @@
 # iiif-content-search
-A IIIF Content Search 2.0 endpoint service as a simple dockerized Flask app.
+A IIIF Content Search 1.0 endpoint service as a simple dockerized Flask app.
 
 ## Run
 
