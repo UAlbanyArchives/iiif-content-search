@@ -8,4 +8,5 @@ services:
       - LOG_LEVEL=INFO
       - SOLR_URL=https://solr2020.library.albany.edu:8984/solr
       - SOLR_CORE=iiif_content_search
+      - PYTHONUNBUFFERED=1
       

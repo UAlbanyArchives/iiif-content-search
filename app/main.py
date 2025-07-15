@@ -1,8 +1,9 @@
 import os
 import re
 import json
-import requests
+import string
 import logging
+import requests
 from flask import Flask, request, jsonify
 from urllib.parse import urlencode
 
@@ -15,6 +16,9 @@ logger = logging.getLogger(__name__)
 SOLR_BASE_URL = os.environ.get("SOLR_URL", "http://localhost:8983/solr")
 SOLR_CORE = os.environ.get("SOLR_CORE", "texts")
 LANG_CODE = os.environ.get("OCR_LANG_CODE", "en")
+
+def normalize(term):
+    return term.strip(string.punctuation).lower()
 
 def escape_solr_term(term):
     # Basic escape for special chars in Solr query syntax
@@ -36,7 +40,7 @@ def query_solr(q, uri, page, rows, object_id=None):
     bbox_field = f"ocr_hitbox_{LANG_CODE}_tsm"
 
     solr_params = {
-        "q": query_word,
+        "q": q,
         "defType": "edismax",
         "qf": f"ocr_text_{LANG_CODE}_tsimv",
         "rows": rows,
@@ -97,7 +101,7 @@ def search_1(collection_id, object_id):
         for idx, val in enumerate(hitboxes):
             try:
                 word, bbox = val.split("|", 1)
-                if not any(term in word.lower() for term in query_terms):
+                if normalize(word) != normalize(q):
                     continue
                 xywh = convert_bbox_to_xywh(bbox)
                 if xywh is None:
@@ -174,25 +178,20 @@ def search_2():
 
             anno_id = f"{request.url_root.rstrip('/')}/annotation/{doc['id']}_{idx}"
             annotations.append({
-                "id": anno_id,
-                "type": "Annotation",
-                "motivation": "highlighting",
-                "target": f"{canvas_id}#xywh={xywh}",
-                "body": {
-                    "type": "TextualBody",
-                    "value": word,
-                    "format": "text/plain"
-                }
+                "@id": anno_id,
+                "@type": "oa:Annotation",
+                "motivation": "sc:painting",
+                "resource": {
+                    "@type": "cnt:ContentAsText",
+                    "chars": word
+                },
+                "on": f"{canvas_id}#xywh={xywh}"
             })
-            annos.append(anno_id)
 
-        hits.append({
-            "type": "Hit",
-            "annotations": annos,
-            "match": q,
-            "before": "",
-            "after": ""
-        })
+            hits.append({
+                "@type": "search:Hit",
+                "annotations": [anno_id]
+            })
 
     base_url = request.base_url
 
