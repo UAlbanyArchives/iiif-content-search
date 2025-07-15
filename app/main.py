@@ -127,9 +127,9 @@ def search_1(collection_id, object_id):
             })
 
     return jsonify({
-        "@context": "http://iiif.io/api/search/0/context.json",
+        "@context": "http://iiif.io/api/search/1/context.json",
         "@id": request.url,
-        "@type": "sc:AnnotationList",
+        "@type": "AnnotationPage",
         "startIndex": start_index,
         "within": {
             "ignored": [],
