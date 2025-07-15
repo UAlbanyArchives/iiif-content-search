@@ -97,7 +97,7 @@ def search_1(collection_id, object_id):
         for idx, val in enumerate(hitboxes):
             try:
                 word, bbox = val.split("|", 1)
-                if word.lower() not in query_terms:
+                if not any(term in word.lower() for term in query_terms):
                     continue
                 xywh = convert_bbox_to_xywh(bbox)
                 if xywh is None:
