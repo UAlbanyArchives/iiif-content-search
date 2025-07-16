@@ -1,7 +1,6 @@
 services:
   iiif-content-search:
     build: .
-    restart: unless-stopped
     ports:
       - "8001:5000"
     environment:
@@ -9,4 +8,10 @@ services:
       - SOLR_URL=https://solr2020.library.albany.edu:8984/solr
       - SOLR_CORE=iiif_content_search
       - PYTHONUNBUFFERED=1
-      
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/search/health"]
+      interval: 30s
+      retries: 3
+      start_period: 10s
+      timeout: 10s

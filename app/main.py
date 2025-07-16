@@ -4,8 +4,9 @@ import json
 import string
 import logging
 import requests
-from flask import Flask, request, jsonify
+from bs4 import BeautifulSoup
 from urllib.parse import urlencode
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
@@ -35,18 +36,24 @@ def convert_bbox_to_xywh(bbox_str):
         logger.error(f"Invalid bbox format: {bbox_str} - {e}")
         return None
 
-def query_solr(q, uri, page, rows, object_id=None):
-    query_word = escape_solr_term(q.lower())
+def query_solr_with_highlighting(q, uri, page, rows, object_id=None):
     bbox_field = f"ocr_hitbox_{LANG_CODE}_tsm"
+    text_field = f"ocr_text_{LANG_CODE}_tsimv"
 
     solr_params = {
         "q": q,
         "defType": "edismax",
-        "qf": f"ocr_text_{LANG_CODE}_tsimv",
+        "qf": text_field,
         "rows": rows,
         "start": (page - 1) * rows,
         "wt": "json",
-        "fl": f"id,canvas_id_ssi,{bbox_field}"
+        "fl": f"id,canvas_id_ssi,{bbox_field},{text_field}",
+        "hl": "true",
+        "hl.fl": text_field,
+        "hl.simple.pre": "<em>",
+        "hl.simple.post": "</em>",
+        "hl.fragsize": 1000,  # large enough to get full context
+        "hl.mergeContiguous": "true"
     }
 
     fq_clauses = []
@@ -54,7 +61,6 @@ def query_solr(q, uri, page, rows, object_id=None):
         fq_clauses.append(f'canvas_id_ssi:"{uri}"')
     if object_id:
         fq_clauses.append(f'object_id_ssi:"{object_id}"')
-
     if fq_clauses:
         solr_params["fq"] = fq_clauses
 
@@ -62,13 +68,11 @@ def query_solr(q, uri, page, rows, object_id=None):
     try:
         solr_resp = requests.get(solr_url, params=solr_params, timeout=10)
         solr_resp.raise_for_status()
-        logger.debug(f"Solr URL: {solr_resp.url}")
         data = solr_resp.json()
-        #logger.debug(json.dumps(data, indent=2))
-        return data.get("response", {}).get("docs", []), data.get("response", {}).get("numFound", 0)
+        return data
     except requests.RequestException as e:
         logger.error(f"Solr error: {e}")
-        return None, None
+        return None
 
 
 @app.route("/search/1/<collection_id>/<object_id>", methods=["GET"])
@@ -82,60 +86,126 @@ def search_1(collection_id, object_id):
     if not q:
         return jsonify({"error": "Missing required query parameter 'q'"}), 400
 
-    docs, total = query_solr(q, uri, page, rows, object_id=f"{collection_id}/{object_id}")
-    if docs is None:
+    solr_data = query_solr_with_highlighting(q, uri, page, rows, object_id=f"{collection_id}/{object_id}")
+    if solr_data is None:
         return jsonify({"error": "Solr unavailable"}), 503
+
+    docs = solr_data.get("response", {}).get("docs", [])
+    total = solr_data.get("response", {}).get("numFound", 0)
+    highlighting = solr_data.get("highlighting", {})
 
     annotations = []
     hits = []
     bbox_field = f"ocr_hitbox_{LANG_CODE}_tsm"
+    text_field = f"ocr_text_{LANG_CODE}_tsimv"
 
-    query_terms = [term.lower() for term in q.split()]
+    query_terms = [normalize(w) for w in q.split()]
+
     for doc in docs:
+        doc_id = doc.get("id")
         canvas_id = doc.get("canvas_id_ssi")
-        if not canvas_id:
+        if not canvas_id or doc_id not in highlighting:
             continue
 
         hitboxes = doc.get(bbox_field, [])
+        doc_text = doc.get(text_field, "")
 
-        # Normalize input phrase into words
-        query_terms = [normalize(w) for w in q.split()]
-
-        # Normalize all hitboxes for easier matching
+        # Normalize all hitboxes for matching
         normalized_hitboxes = [
             (normalize(val.split("|", 1)[0]), val.split("|", 1)[1])
             for val in hitboxes if "|" in val
         ]
 
-        # Search for the query_terms as a sequence
-        for i in range(len(normalized_hitboxes) - len(query_terms) + 1):
-            words_window = normalized_hitboxes[i:i+len(query_terms)]
-            window_words = [w for w, _ in words_window]
+        # Get the highlighted snippets for this doc
+        highlight_snippets = highlighting.get(doc_id, {}).get(text_field, [])
 
-            if window_words == query_terms:
-                anno_ids = []
-                for j, (matched_word, matched_bbox) in enumerate(words_window):
-                    xywh = convert_bbox_to_xywh(matched_bbox)
-                    if xywh is None:
-                        continue
+        for snippet in highlight_snippets:
+            # snippet contains <em>...</em> around matched terms/phrases
+            # Remove html tags but keep <em> markers for matching
+            # Split snippet by whitespace, noting which words are in <em>...</em>
 
-                    anno_id = f"{request.url_root.rstrip('/')}/annotation/{doc['id']}_{i + j}"
-                    annotations.append({
-                        "@id": anno_id,
-                        "@type": "oa:Annotation",
-                        "motivation": "sc:painting",
-                        "resource": {
-                            "@type": "cnt:ContentAsText",
-                            "chars": matched_word
-                        },
-                        "on": f"{canvas_id}#xywh={xywh}"
-                    })
-                    anno_ids.append(anno_id)
+            # Parse snippet as HTML to detect <em> tags
+            soup = BeautifulSoup(snippet, "html.parser")
+            words_with_em = []
+            for elem in soup.recursiveChildGenerator():
+                if isinstance(elem, str):
+                    # split text by whitespace
+                    for w in elem.split():
+                        words_with_em.append((normalize(w), False))
+                elif elem.name == "em":
+                    # highlighted word(s)
+                    highlighted_text = elem.get_text(" ", strip=True)
+                    for w in highlighted_text.split():
+                        words_with_em.append((normalize(w), True))
 
-                hits.append({
-                    "@type": "search:Hit",
-                    "annotations": anno_ids
-                })
+            # Identify continuous spans of highlighted words (the phrase matches)
+            # We'll find runs where em=True for consecutive words
+
+            idx = 0
+            while idx < len(words_with_em):
+                if words_with_em[idx][1]:
+                    # Start of phrase match
+                    start_idx = idx
+                    while idx < len(words_with_em) and words_with_em[idx][1]:
+                        idx += 1
+                    end_idx = idx  # exclusive
+
+                    phrase_words = [w for w, _ in words_with_em[start_idx:end_idx]]
+
+                    # Find this phrase sequence in normalized_hitboxes
+                    # Naive approach: scan hitboxes for exact phrase match
+
+                    for i in range(len(normalized_hitboxes) - len(phrase_words) + 1):
+                        window = normalized_hitboxes[i:i+len(phrase_words)]
+                        window_words = [w for w, _ in window]
+                        if window_words == phrase_words:
+                            # Combine bounding boxes into one
+                            bboxes = [w[1] for w in window]
+                            xywhs = [convert_bbox_to_xywh(b) for b in bboxes]
+                            # Skip if any invalid bbox
+                            if None in xywhs:
+                                continue
+
+                            # Calculate union bbox (smallest rectangle containing all)
+                            xs = []
+                            ys = []
+                            xe = []
+                            ye = []
+                            for b in bboxes:
+                                x1, y1, x2, y2 = map(int, b.split())
+                                xs.append(x1)
+                                ys.append(y1)
+                                xe.append(x2)
+                                ye.append(y2)
+
+                            union_x1 = min(xs)
+                            union_y1 = min(ys)
+                            union_x2 = max(xe)
+                            union_y2 = max(ye)
+                            width = union_x2 - union_x1
+                            height = union_y2 - union_y1
+                            xywh = f"{union_x1},{union_y1},{width},{height}"
+
+                            # Create annotation for phrase
+                            anno_id = f"{request.url_root.rstrip('/')}/annotation/{doc_id}_{i}_{i+len(phrase_words)-1}"
+                            annotations.append({
+                                "@id": anno_id,
+                                "@type": "oa:Annotation",
+                                "motivation": "sc:painting",
+                                "resource": {
+                                    "@type": "cnt:ContentAsText",
+                                    "chars": " ".join(phrase_words)
+                                },
+                                "on": f"{canvas_id}#xywh={xywh}"
+                            })
+
+                            hits.append({
+                                "@type": "search:Hit",
+                                "annotations": [anno_id]
+                            })
+                            break  # phrase found, no need to find again in this snippet
+                else:
+                    idx += 1
 
     return jsonify({
         "@context": "http://iiif.io/api/search/1/context.json",
@@ -150,85 +220,6 @@ def search_1(collection_id, object_id):
         "hits": hits,
         "resources": annotations
     })
-
-
-# not fully implemented
-@app.route("/search/2/<collection_id>/<object_id>", methods=["GET"])
-def search_2():
-    q = request.args.get("q")
-    uri = request.args.get("uri")
-    page = int(request.args.get("page", 1))
-    rows = int(request.args.get("rows", 50))
-
-    if not q:
-        return jsonify({"error": "Missing required query parameter 'q'"}), 400
-
-    docs, total = query_solr(q, uri, page, rows)
-    if docs is None:
-        return jsonify({"error": "Solr unavailable"}), 503
-
-    hits = []
-    annotations = []
-    bbox_field = f"ocr_hitbox_{LANG_CODE}_tsm"
-
-    for doc in docs:
-        canvas_id = doc.get("canvas_id_ssi")
-        if not canvas_id:
-            continue
-
-        hitboxes = doc.get(bbox_field, [])
-        annos = []
-        for idx, val in enumerate(hitboxes):
-            try:
-                word, bbox = val.split("|", 1)
-                xywh = convert_bbox_to_xywh(bbox)
-                if xywh is None:
-                    continue
-            except Exception:
-                continue
-
-            anno_id = f"{request.url_root.rstrip('/')}/annotation/{doc['id']}_{idx}"
-            annotations.append({
-                "@id": anno_id,
-                "@type": "oa:Annotation",
-                "motivation": "sc:painting",
-                "resource": {
-                    "@type": "cnt:ContentAsText",
-                    "chars": word
-                },
-                "on": f"{canvas_id}#xywh={xywh}"
-            })
-
-            hits.append({
-                "@type": "search:Hit",
-                "annotations": [anno_id]
-            })
-
-    base_url = request.base_url
-
-    def with_page(p):
-        q_args = request.args.copy()
-        q_args["page"] = str(p)
-        return f"{base_url}?{urlencode(q_args)}"
-
-    response = {
-        "@context": "http://iiif.io/api/search/2/context.json",
-        "id": request.url,
-        "type": "AnnotationCollection",
-        "within": {
-            "type": "OrderedCollection",
-            "total": total
-        },
-        "resources": annotations,
-        "hits": hits
-    }
-
-    if total > page * rows:
-        response["within"]["next"] = with_page(page + 1)
-    if page > 1:
-        response["within"]["prev"] = with_page(page - 1)
-
-    return jsonify(response)
 
 
 @app.route("/annotation/<annotation_id>", methods=["GET"])
