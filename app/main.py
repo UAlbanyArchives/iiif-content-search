@@ -98,33 +98,44 @@ def search_1(collection_id, object_id):
 
         hitboxes = doc.get(bbox_field, [])
 
-        for idx, val in enumerate(hitboxes):
-            try:
-                word, bbox = val.split("|", 1)
-                if normalize(word) != normalize(q):
-                    continue
-                xywh = convert_bbox_to_xywh(bbox)
-                if xywh is None:
-                    continue
-            except Exception:
-                continue
+        # Normalize input phrase into words
+        query_terms = [normalize(w) for w in q.split()]
 
-            anno_id = f"{request.url_root.rstrip('/')}/annotation/{doc['id']}_{idx}"
-            annotations.append({
-                "@id": anno_id,
-                "@type": "oa:Annotation",
-                "motivation": "sc:painting",
-                "resource": {
-                    "@type": "cnt:ContentAsText",
-                    "chars": word
-                },
-                "on": f"{canvas_id}#xywh={xywh}"
-            })
+        # Normalize all hitboxes for easier matching
+        normalized_hitboxes = [
+            (normalize(val.split("|", 1)[0]), val.split("|", 1)[1])
+            for val in hitboxes if "|" in val
+        ]
 
-            hits.append({
-                "@type": "search:Hit",
-                "annotations": [anno_id]
-            })
+        # Search for the query_terms as a sequence
+        for i in range(len(normalized_hitboxes) - len(query_terms) + 1):
+            words_window = normalized_hitboxes[i:i+len(query_terms)]
+            window_words = [w for w, _ in words_window]
+
+            if window_words == query_terms:
+                anno_ids = []
+                for j, (matched_word, matched_bbox) in enumerate(words_window):
+                    xywh = convert_bbox_to_xywh(matched_bbox)
+                    if xywh is None:
+                        continue
+
+                    anno_id = f"{request.url_root.rstrip('/')}/annotation/{doc['id']}_{i + j}"
+                    annotations.append({
+                        "@id": anno_id,
+                        "@type": "oa:Annotation",
+                        "motivation": "sc:painting",
+                        "resource": {
+                            "@type": "cnt:ContentAsText",
+                            "chars": matched_word
+                        },
+                        "on": f"{canvas_id}#xywh={xywh}"
+                    })
+                    anno_ids.append(anno_id)
+
+                hits.append({
+                    "@type": "search:Hit",
+                    "annotations": anno_ids
+                })
 
     return jsonify({
         "@context": "http://iiif.io/api/search/1/context.json",
